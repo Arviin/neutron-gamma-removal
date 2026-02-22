@@ -1,0 +1,19 @@
+# pixi
+.pixi/
+
+# python
+__pycache__/
+*.pyc
+
+# caches
+.pytest_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# data (if you have data folder)
+data/
+outputs/
+results/
