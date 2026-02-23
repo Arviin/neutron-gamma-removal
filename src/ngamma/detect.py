@@ -6,6 +6,26 @@ from tqdm import tqdm
 import warnings
 from scipy.ndimage import uniform_filter
 from scipy.ndimage import uniform_filter, binary_dilation
+from scipy.ndimage import label, generate_binary_structure
+
+
+def _keep_small_components(mask2d: np.ndarray, max_area: int, connectivity: int = 2) -> np.ndarray:
+    """
+    Keep only connected components with area <= max_area.
+    connectivity=2 -> 8-connected in 2D.
+    """
+    if max_area <= 0 or not mask2d.any():
+        return mask2d
+
+    st = generate_binary_structure(2, connectivity)
+    lab, nlab = label(mask2d, structure=st)
+    if nlab == 0:
+        return mask2d
+
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0
+    keep_labels = np.where(sizes <= max_area)[0]
+    return np.isin(lab, keep_labels)
 
 
 
@@ -58,6 +78,8 @@ def gamma_remove_hampel_tiled(
     edge_q: float = 0.99,      # edge band = top (1-edge_q) gradients
     edge_gate: bool = True,     # if True: forbid temporal gamma detection on edges
     edge_dilate: int = 3,   # grow edge band by this many pixels
+    cc_max_area: int = 12,     # keep only small connected components
+    cc_connectivity: int = 2,  # 2 -> 8-connectivity in 2D
 
     
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -142,6 +164,13 @@ def gamma_remove_hampel_tiled(
                             if edge_dilate > 0:
                                 eb = binary_dilation(eb, iterations=edge_dilate)
                             m[i] = m[i]  & (~eb)
+                    # ---- Connected-component pruning: reject edge-like chains
+                    if np.any(m) and cc_max_area > 0 :
+                        m3 = np.zeros_like(m, dtype=bool)
+                        for i in range(N):
+                            if not m[i].any():
+                                continue
+                            m3[i] = _keep_small_components(m[i], max_area= cc_max_area, connectivity=cc_connectivity)
   
 
                     # store final mask
