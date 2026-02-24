@@ -4,9 +4,10 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from tqdm import tqdm
 import warnings
-from scipy.ndimage import uniform_filter
 from scipy.ndimage import uniform_filter, binary_dilation
 from scipy.ndimage import label, generate_binary_structure
+
+
 
 
 def _keep_small_components(mask2d: np.ndarray, max_area: int, connectivity: int = 2) -> np.ndarray:
@@ -61,6 +62,127 @@ def _nan_aware_local_mean_std(img: np.ndarray, size: int, eps: float = 1e-6):
     var = np.maximum(mu2 - mu * mu, 0.0)
     sigma = np.sqrt(var).astype(np.float32)
     return mu.astype(np.float32), sigma
+
+
+def gamma_remove_trend_tiled(
+    T: np.ndarray,
+    *,
+    k: int = 4,
+    tau_t: float = 6.0,
+    s_floor_t: float = 1e-6,
+    tile: int = 256,
+    spatial_size: int = 9,
+    tau_s: float = 6.0,
+    s_floor_s: float = 1e-6,
+    edge_q: float = 0.99,
+    edge_gate: bool = True,
+    edge_dilate: int = 3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Trend-removed temporal outlier detection.
+
+    Key idea:
+      - First remove a robust local *linear trend* across angle inside each Hampel window.
+      - Then run the same MAD-based threshold test on the *detrended residuals*.
+    This prevents edge-driven angular drift (wobble/PSF/scatter mismatch) from being misclassified as spikes.
+
+    Returns:
+      Tcorr: corrected transmission (NaNs preserved)
+      gmask: mask of flagged pixels
+    """
+    if T.ndim != 3:
+        raise ValueError("T must have shape (N,H,W)")
+    if spatial_size % 2 == 0 or spatial_size < 3:
+        raise ValueError("spatial_size must be odd and >= 3")
+
+    N, H, W = T.shape
+    win = 2 * k + 1
+
+    # circular pad in angle
+    Tpad = np.concatenate([T[-k:], T, T[:k]], axis=0)
+
+    Tcorr = T.copy()
+    gmask = np.zeros((N, H, W), dtype=bool)
+
+    y_starts = list(range(0, H, tile))
+    x_starts = list(range(0, W, tile))
+    total_tiles = len(y_starts) * len(x_starts)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+
+        with tqdm(total=total_tiles, desc="Trend+spatial tiles", unit="tile") as pbar:
+            for y0 in y_starts:
+                y1 = min(H, y0 + tile)
+                for x0 in x_starts:
+                    x1 = min(W, x0 + tile)
+
+                    Tp = Tpad[:, y0:y1, x0:x1]     # (N+2k, th, tw)
+                    Tt = T[:,   y0:y1, x0:x1]      # (N,   th, tw)
+
+                    # windows: (N, th, tw, win)
+                    Wv = sliding_window_view(Tp, window_shape=win, axis=0)
+
+                    # robust "center" (median at each angle position)
+                    med_t = np.nanmedian(Wv, axis=-1)  # (N, th, tw)
+
+                    # robust slope proxy:
+                    # slope = (median(right half) - median(left half)) / (2k)
+                    left = Wv[..., :k]        # (N,th,tw,k)
+                    right = Wv[..., k+1:]     # (N,th,tw,k)
+                    med_L = np.nanmedian(left, axis=-1)
+                    med_R = np.nanmedian(right, axis=-1)
+                    slope = (med_R - med_L) / max(2*k, 1)
+
+                    # detrend the window for robust scale:
+                    j = (np.arange(win, dtype=np.float32) - k)  # (-k..k)
+                    # broadcast to (1,1,1,win)
+                    j = j[None, None, None, :]
+                    Wv_detr = Wv - (med_t[..., None] + slope[..., None] * j)
+
+                    # robust scale on detrended window
+                    med_d = np.nanmedian(Wv_detr, axis=-1)
+                    mad_d = np.nanmedian(np.abs(Wv_detr - med_d[..., None]), axis=-1)
+                    s_t = 1.4826 * mad_d + s_floor_t
+
+                    # residual at center relative to median center
+                    z_t = (Tt - med_t) / s_t
+
+                    finite_t = np.isfinite(Tt) & np.isfinite(med_t) & np.isfinite(s_t)
+                    m = finite_t & (z_t > tau_t)
+
+                    # spatial confirmation (same as before)
+                    if np.any(m):
+                        m2 = np.zeros_like(m, dtype=bool)
+                        for i in range(N):
+                            if not m[i].any():
+                                continue
+                            img = Tt[i]
+                            mu_s, sig_s = _nan_aware_local_mean_std(img, size=spatial_size, eps=1e-6)
+                            z_s = (img - mu_s) / (sig_s + s_floor_s)
+                            ok = np.isfinite(z_s) & (z_s > tau_s)
+                            m2[i] = m[i] & ok
+                        m = m2
+
+                    # edge gating
+                    if edge_gate and np.any(m):
+                        for i in range(N):
+                            if not m[i].any():
+                                continue
+                            eb = _edge_band_mask(Tt[i], q=edge_q)
+                            if edge_dilate > 0:
+                                eb = binary_dilation(eb, iterations=edge_dilate)
+                            m[i] = m[i] & (~eb)
+
+                    # store + correct
+                    gmask[:, y0:y1, x0:x1] = m
+                    Tc = Tt.copy()
+                    Tc[m] = med_t[m]
+                    Tcorr[:, y0:y1, x0:x1] = Tc
+
+                    pbar.update(1)
+
+    return Tcorr.astype(np.float32), gmask
 
 
 def gamma_remove_hampel_tiled(
@@ -171,6 +293,7 @@ def gamma_remove_hampel_tiled(
                             if not m[i].any():
                                 continue
                             m3[i] = _keep_small_components(m[i], max_area= cc_max_area, connectivity=cc_connectivity)
+                        m = m3
   
 
                     # store final mask

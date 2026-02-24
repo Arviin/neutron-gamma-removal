@@ -5,7 +5,7 @@ from .io_fits import list_sorted, read_fits, write_fits
 from .config import ScanConfig
 from .masks import make_detector_stability_mask
 from .preprocess import compute_transmission, log_transform
-from .detect import gamma_remove_hampel_tiled
+from .detect import gamma_remove_trend_tiled
 from .postprocess import fill_nans_nearest
 from .spatial_cleanup import spatial_impulse_cleanup
 
@@ -77,7 +77,18 @@ def process_scan(cfg: ScanConfig):
 
     # ---- Gamma removal: temporal Hampel (tiled, circular, NaN-safe)
     print("Running temporal Hampel gamma removal...")
-    Tcorr, gmask = gamma_remove_hampel_tiled(Tstack,k=4,tau_t=6.0,s_floor_t=1e-6,tile=256,spatial_size=9,tau_s=6.0,s_floor_s=1e-6,)
+    Tcorr, gmask = gamma_remove_trend_tiled(
+    Tstack,
+    k=4,
+    tau_t=6.0,
+    s_floor_t=1e-6,
+    tile=256,
+    spatial_size=9,
+    tau_s=6.0,
+    s_floor_s=1e-6,
+    edge_q=0.99,
+    edge_gate=True,
+    edge_dilate=3,)
 
     flagged = int(np.sum(gmask))
     finite2 = int(np.sum(np.isfinite(Tstack)))
