@@ -15,10 +15,14 @@ def process_scan(cfg: ScanConfig):
 
     print("Raw folder:", cfg.raw_folder)
     print("Output folder:", cfg.output_folder.resolve())
+    out = cfg.output_folder
+    print("Run output folder:", out.resolve())
 
     raw_files = list_sorted(cfg.raw_folder, f"ct{cfg.exposure_prefix}")
     ob_files  = list_sorted(cfg.raw_folder, f"ob{cfg.exposure_prefix}")
     dc_files  = list_sorted(cfg.raw_folder, f"dc{cfg.exposure_prefix}")
+
+    print("ROI:", cfg.roi)
 
     print("Number of raw projections:", len(raw_files))
     print("Number of OB frames:", len(ob_files))
@@ -38,8 +42,8 @@ def process_scan(cfg: ScanConfig):
 
 
     # ---- Load OB/DC stacks
-    OB_stack = np.stack([read_fits(p) for p in ob_files], axis=0)  # (10,H,W)
-    DC_stack = np.stack([read_fits(p) for p in dc_files], axis=0)
+    OB_stack = np.stack([read_fits(p, roi = cfg.roi) for p in ob_files], axis=0)  # (10,H,W)
+    DC_stack = np.stack([read_fits(p, roi = cfg.roi) for p in dc_files], axis=0)
 
     # ---- Build stability mask (starting parameters)
     good_mask, diag = make_detector_stability_mask(
@@ -55,10 +59,10 @@ def process_scan(cfg: ScanConfig):
     print(f"Good pixels: {good_frac:.2f}% (masked {100.0-good_frac:.2f}%)")
 
     # Save diagnostics immediately (so you see outputs even if you interrupt later)
-    write_fits(cfg.output_folder / "masks" / "good_mask.fits", good_mask.astype(np.float32))
-    write_fits(cfg.output_folder / "masks" / "den.fits", diag["den"])
-    write_fits(cfg.output_folder / "masks" / "ob_mean.fits", diag["OB_mean"])
-    write_fits(cfg.output_folder / "masks" / "ob_std.fits", diag["OB_std"])
+    write_fits(out/ "masks" / "good_mask.fits", good_mask.astype(np.float32))
+    write_fits(out / "masks" / "den.fits", diag["den"])
+    write_fits(out / "masks" / "ob_mean.fits", diag["OB_mean"])
+    write_fits(out / "masks" / "ob_std.fits", diag["OB_std"])
 
     # ---- Build transmission stack in RAM
     print("Loading and normalizing all projections into transmission stack...")
@@ -67,7 +71,7 @@ def process_scan(cfg: ScanConfig):
     Tstack = np.empty((N, H, W), dtype=np.float32)
 
     for i, rp in enumerate(tqdm(raw_files)):
-        I = read_fits(rp)
+        I = read_fits(rp, roi = cfg.roi)
         T = compute_transmission(I, diag["OB_mean"], diag["DC_mean"], good_mask)
         Tstack[i] = T
 
@@ -104,9 +108,9 @@ def process_scan(cfg: ScanConfig):
         idx = rp.name.split("_")[-1]  # "00001.fits"
 
         # 1) NaN-preserving
-        write_fits(cfg.output_folder / "transmission_corr" / f"Tcorr_{idx}", Tcorr[i])
-        write_fits(cfg.output_folder / "log_corr" / f"logcorr_{idx}", log_transform(Tcorr[i]))
-        write_fits(cfg.output_folder / "masks" / "gamma" / f"gamma_{idx}", gmask[i].astype(np.float32))
+        write_fits(out / "transmission_corr" / f"Tcorr_{idx}", Tcorr[i])
+        write_fits(out / "log_corr" / f"logcorr_{idx}", log_transform(Tcorr[i]))
+        write_fits(out / "masks" / "gamma" / f"gamma_{idx}", gmask[i].astype(np.float32))
 
         # 2) NaN-filled (for viewing/recon)
         Tfill = fill_nans_nearest(Tcorr[i])
@@ -115,13 +119,13 @@ def process_scan(cfg: ScanConfig):
         # Use the SAME good_mask to avoid inventing values in masked detector regions.
         Tclean, smask = spatial_impulse_cleanup(Tfill,good_mask,win=5,tau_s=8.0,grad_q=0.995,max_area=25,)
 
-        write_fits(cfg.output_folder / "transmission_corr_filled" / f"TcorrFill_{idx}", Tfill)
-        write_fits(cfg.output_folder / "log_corr_filled" / f"logcorrFill_{idx}", log_transform(Tfill))
+        write_fits(out / "transmission_corr_filled" / f"TcorrFill_{idx}", Tfill)
+        write_fits(out / "log_corr_filled" / f"logcorrFill_{idx}", log_transform(Tfill))
 
         # Save the cleaned version separately (this is what you show in ImageJ / use for recon)
-        write_fits(cfg.output_folder / "transmission_corr_clean" / f"Tclean_{idx}", Tclean)
-        write_fits(cfg.output_folder / "log_corr_clean" / f"logclean_{idx}", log_transform(Tclean))
-        write_fits(cfg.output_folder / "masks" / "spatial" / f"spatial_{idx}", smask.astype(np.float32))
+        write_fits(out / "transmission_corr_clean" / f"Tclean_{idx}", Tclean)
+        write_fits(out / "log_corr_clean" / f"logclean_{idx}", log_transform(Tclean))
+        write_fits(out / "masks" / "spatial" / f"spatial_{idx}", smask.astype(np.float32))
 
 
     print("Done.")
