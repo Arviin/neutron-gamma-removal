@@ -34,6 +34,10 @@ def read_fits(path: Path, roi: Optional[Tuple[int, int, int, int]] = None) -> np
 
     if roi is not None:
         y0, y1, x0, x1 = roi
+
+        if not (0 <= y0 < y1 <= data.shape[0] and 0 <= x0 < x1 <= data.shape[1]):
+            raise ValueError(f"Invalid ROI {roi} for image shape {data.shape}")
+
         data = data[y0:y1, x0:x1]
 
     return data

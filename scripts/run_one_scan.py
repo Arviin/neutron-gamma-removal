@@ -31,6 +31,7 @@ def main():
         raw_folder=raw_folder,
         output_folder=output_folder,
         exposure_prefix=exposure_prefix,
+        roi = (106, 1942, 126, 1798)
     )
 
     # Make a run-specific output folder so you never mix runs again
