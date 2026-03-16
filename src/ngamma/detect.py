@@ -63,6 +63,48 @@ def _nan_aware_local_mean_std(img: np.ndarray, size: int, eps: float = 1e-6):
     sigma = np.sqrt(var).astype(np.float32)
     return mu.astype(np.float32), sigma
 
+def _nan_aware_local_median_mad(img: np.ndarray, size: int, eps: float = 1e-6):
+    """
+    NaN-aware local median and MAD using sliding windows.
+
+    Parameters
+    ----------
+    img : (H, W) float32
+        Image with possible NaNs.
+    size : int
+        Odd neighborhood size.
+    eps : float
+        Small floor for the returned scale.
+
+    Returns
+    -------
+    med : (H, W) float32
+        Local median.
+    madn : (H, W) float32
+        Local robust scale = 1.4826 * MAD + eps.
+    """
+    if size % 2 == 0 or size < 3:
+        raise ValueError("size must be odd and >= 3")
+
+    pad = size // 2
+
+    # pad with NaNs so local windows near borders are still valid
+    img_pad = np.pad(img, pad_width=pad, mode="constant", constant_values=np.nan)
+
+    # windows shape: (H, W, size, size)
+    Wv = sliding_window_view(img_pad, (size, size))
+
+    # flatten neighborhood to last axis: (H, W, size*size)
+    Wf = Wv.reshape(Wv.shape[0], Wv.shape[1], -1)
+
+    med = np.nanmedian(Wf, axis=-1)
+    mad = np.nanmedian(np.abs(Wf - med[..., None]), axis=-1)
+
+    madn = 1.4826 * mad + eps
+
+    return med.astype(np.float32), madn.astype(np.float32)
+
+
 
 def gamma_remove_trend_tiled(
     T: np.ndarray,
@@ -77,18 +119,54 @@ def gamma_remove_trend_tiled(
     edge_q: float = 0.99,
     edge_gate: bool = True,
     edge_dilate: int = 3,
-) -> tuple[np.ndarray, np.ndarray]:
+    edge_tau_boost: float = 2.0,
+    return_debug: bool = False,
+):
     """
-    Trend-removed temporal outlier detection.
+    Trend-removed temporal outlier detection with robust spatial confirmation
+    and soft edge-aware temporal thresholding.
 
-    Key idea:
-      - First remove a robust local *linear trend* across angle inside each Hampel window.
-      - Then run the same MAD-based threshold test on the *detrended residuals*.
-    This prevents edge-driven angular drift (wobble/PSF/scatter mismatch) from being misclassified as spikes.
+    Main idea
+    ---------
+    1) Detect angular outliers at fixed detector coordinates
+    2) Confirm them with robust local spatial prominence
+    3) Near strong edges, require stronger temporal evidence,
+       but do NOT hard-forbid detections
 
-    Returns:
-      Tcorr: corrected transmission (NaNs preserved)
-      gmask: mask of flagged pixels
+    Parameters
+    ----------
+    T : (N, H, W) float32
+        Transmission stack
+    k : int
+        Temporal half-window
+    tau_t : float
+        Base temporal threshold
+    s_floor_t : float
+        Floor for temporal robust scale
+    tile : int
+        Tile size in (H, W)
+    spatial_size : int
+        Odd local neighborhood for spatial confirmation
+    tau_s : float
+        Spatial robust z threshold
+    s_floor_s : float
+        Floor for spatial robust scale
+    edge_q : float
+        Gradient quantile defining edge band
+    edge_gate : bool
+        If True, apply soft edge-aware temporal threshold
+    edge_dilate : int
+        Dilate edge band this many pixels
+    edge_tau_boost : float
+        Additional temporal threshold added on edge band
+    return_debug : bool
+        If True, return stage masks for debugging
+
+    Returns
+    -------
+    Tcorr, gmask
+        or
+    Tcorr, gmask, debug
     """
     if T.ndim != 3:
         raise ValueError("T must have shape (N,H,W)")
@@ -104,6 +182,9 @@ def gamma_remove_trend_tiled(
     Tcorr = T.copy()
     gmask = np.zeros((N, H, W), dtype=bool)
 
+    temporal_mask = np.zeros((N, H, W), dtype=bool) if return_debug else None
+    spatial_mask  = np.zeros((N, H, W), dtype=bool) if return_debug else None
+
     y_starts = list(range(0, H, tile))
     x_starts = list(range(0, W, tile))
     total_tiles = len(y_starts) * len(x_starts)
@@ -114,73 +195,107 @@ def gamma_remove_trend_tiled(
         with tqdm(total=total_tiles, desc="Trend+spatial tiles", unit="tile") as pbar:
             for y0 in y_starts:
                 y1 = min(H, y0 + tile)
+
                 for x0 in x_starts:
                     x1 = min(W, x0 + tile)
 
-                    Tp = Tpad[:, y0:y1, x0:x1]     # (N+2k, th, tw)
-                    Tt = T[:,   y0:y1, x0:x1]      # (N,   th, tw)
+                    Tp = Tpad[:, y0:y1, x0:x1]   # (N+2k, th, tw)
+                    Tt = T[:,   y0:y1, x0:x1]    # (N,   th, tw)
 
                     # windows: (N, th, tw, win)
                     Wv = sliding_window_view(Tp, window_shape=win, axis=0)
 
-                    # robust "center" (median at each angle position)
+                    # robust center
                     med_t = np.nanmedian(Wv, axis=-1)  # (N, th, tw)
 
-                    # robust slope proxy:
-                    # slope = (median(right half) - median(left half)) / (2k)
-                    left = Wv[..., :k]        # (N,th,tw,k)
-                    right = Wv[..., k+1:]     # (N,th,tw,k)
+                    # robust local slope proxy
+                    left = Wv[..., :k]
+                    right = Wv[..., k+1:]
                     med_L = np.nanmedian(left, axis=-1)
                     med_R = np.nanmedian(right, axis=-1)
-                    slope = (med_R - med_L) / max(2*k, 1)
+                    slope = (med_R - med_L) / max(2 * k, 1)
 
-                    # detrend the window for robust scale:
-                    j = (np.arange(win, dtype=np.float32) - k)  # (-k..k)
-                    # broadcast to (1,1,1,win)
-                    j = j[None, None, None, :]
+                    # detrended window
+                    j = (np.arange(win, dtype=np.float32) - k)[None, None, None, :]
                     Wv_detr = Wv - (med_t[..., None] + slope[..., None] * j)
 
-                    # robust scale on detrended window
+                    # robust scale on detrended residuals
                     med_d = np.nanmedian(Wv_detr, axis=-1)
                     mad_d = np.nanmedian(np.abs(Wv_detr - med_d[..., None]), axis=-1)
                     s_t = 1.4826 * mad_d + s_floor_t
 
-                    # residual at center relative to median center
+                    # temporal robust z
                     z_t = (Tt - med_t) / s_t
-
                     finite_t = np.isfinite(Tt) & np.isfinite(med_t) & np.isfinite(s_t)
-                    m = finite_t & (z_t > tau_t)
 
-                    # spatial confirmation (same as before)
-                    if np.any(m):
-                        m2 = np.zeros_like(m, dtype=bool)
+                    # --------------------------------------------------------
+                    # SOFT EDGE-AWARE TEMPORAL THRESHOLD
+                    # --------------------------------------------------------
+                    tau_eff = np.full_like(Tt, tau_t, dtype=np.float32)
+
+                    if edge_gate:
                         for i in range(N):
-                            if not m[i].any():
-                                continue
                             img = Tt[i]
-                            mu_s, sig_s = _nan_aware_local_mean_std(img, size=spatial_size, eps=1e-6)
-                            z_s = (img - mu_s) / (sig_s + s_floor_s)
-                            ok = np.isfinite(z_s) & (z_s > tau_s)
-                            m2[i] = m[i] & ok
-                        m = m2
+                            eb = _edge_band_mask(img, q=edge_q)
 
-                    # edge gating
-                    if edge_gate and np.any(m):
-                        for i in range(N):
-                            if not m[i].any():
-                                continue
-                            eb = _edge_band_mask(Tt[i], q=edge_q)
                             if edge_dilate > 0:
                                 eb = binary_dilation(eb, iterations=edge_dilate)
-                            m[i] = m[i] & (~eb)
 
-                    # store + correct
+                            tau_eff[i][eb] = tau_t + edge_tau_boost
+
+                    m = finite_t & (z_t > tau_eff)
+                    m_temporal = m.copy()
+
+                    # --------------------------------------------------------
+                    # ROBUST SPATIAL CONFIRMATION (median / MAD)
+                    # --------------------------------------------------------
+                    if np.any(m):
+                        m2 = np.zeros_like(m, dtype=bool)
+
+                        for i in range(N):
+                            if not m[i].any():
+                                continue
+
+                            img = Tt[i]
+                            med_s, madn_s = _nan_aware_local_median_mad(
+                                img,
+                                size=spatial_size,
+                                eps=s_floor_s,
+                            )
+
+                            z_s = (img - med_s) / madn_s
+                            ok = np.isfinite(z_s) & (z_s > tau_s)
+
+                            m2[i] = m[i] & ok
+
+                        m = m2
+
+                    m_spatial = m.copy()
+
+                    # --------------------------------------------------------
+                    # STORE DEBUG MASKS
+                    # --------------------------------------------------------
+                    if return_debug:
+                        temporal_mask[:, y0:y1, x0:x1] = m_temporal
+                        spatial_mask[:, y0:y1, x0:x1] = m_spatial
+
+                    # final mask
                     gmask[:, y0:y1, x0:x1] = m
+
+                    # correction
                     Tc = Tt.copy()
                     Tc[m] = med_t[m]
                     Tcorr[:, y0:y1, x0:x1] = Tc
 
                     pbar.update(1)
+
+    if return_debug:
+        debug = {
+            "temporal_mask": temporal_mask,
+            "spatial_mask": spatial_mask,
+            "final_mask": gmask,
+        }
+        return Tcorr.astype(np.float32), gmask, debug
 
     return Tcorr.astype(np.float32), gmask
 
