@@ -1,7 +1,7 @@
 from pathlib import Path
 import sys
+import warnings
 import numpy as np
-from astropy.io import fits
 
 # ------------------------------------------------------------
 # Make ngamma importable
@@ -24,38 +24,28 @@ from ngamma.detect import gamma_remove_trend_tiled
 RAW_FOLDER = Path(r"D:\mpc3091-Qianru\0_data\01_ballpacking_snr\02_rawdata2\05_ct10s")
 EXPOSURE_PREFIX = "10s"
 
-# SAME ROI as current pipeline
 ROI = (106, 1942, 188, 1860)
+TARGET_IDX = 606
 
-# Benchmark projection
-TARGET_IDX = 606   # file *_00606.fits
+# Reduced, most-informative benchmark
+TAU_T_LIST = [6.0, 5.0, 4.0]
+AMPLITUDES = [0.10, 0.20]
+SHAPES = ["pixel", "blob3"]
 
-# Injection amplitudes in transmission units
-AMPLITUDES = [0.02, 0.05, 0.10, 0.20]
-
-# Injection shapes to test
-SHAPES = ["pixel", "blob2", "blob3"]
-
-# Number of injected events per region per amplitude per shape
 N_INJECT = 100
 
-# Region definitions
 EDGE_Q = 0.995
 BORDER_EXCLUDE = 20
 NBINS = 512
 
-# Define "flat/smooth" subregions using LOW local-variability quantiles
 BG_GRAD_Q = 0.50
 BG_MAD_Q = 0.50
 BULK_GRAD_Q = 0.50
 BULK_MAD_Q = 0.50
-
-# Local window size for region smoothness definition
 LOCAL_SIZE = 9
 
-# Detector parameters (same as current pipeline)
+# Fixed detector settings except tau_t
 DET_K = 4
-DET_TAU_T = 6.0
 DET_S_FLOOR_T = 1e-6
 DET_TILE = 256
 DET_SPATIAL_SIZE = 9
@@ -124,10 +114,6 @@ def otsu_threshold(values: np.ndarray, nbins: int = 512) -> float:
 
 
 def nan_local_median_mad_2d(img: np.ndarray, size: int, eps: float = 1e-6):
-    """
-    NaN-aware local median and MAD on a single 2D image.
-    Used ONLY to define smooth/flat benchmark regions.
-    """
     if size % 2 == 0 or size < 3:
         raise ValueError("size must be odd and >= 3")
 
@@ -138,10 +124,12 @@ def nan_local_median_mad_2d(img: np.ndarray, size: int, eps: float = 1e-6):
     Wv = sliding_window_view(img_pad, (size, size))
     Wf = Wv.reshape(Wv.shape[0], Wv.shape[1], -1)
 
-    med = np.nanmedian(Wf, axis=-1)
-    mad = np.nanmedian(np.abs(Wf - med[..., None]), axis=-1)
-    madn = 1.4826 * mad + eps
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+        med = np.nanmedian(Wf, axis=-1)
+        mad = np.nanmedian(np.abs(Wf - med[..., None]), axis=-1)
 
+    madn = 1.4826 * mad + eps
     return med.astype(np.float32), madn.astype(np.float32)
 
 
@@ -153,9 +141,6 @@ def qthr(values: np.ndarray, q: float) -> float:
 
 
 def sample_centers(mask: np.ndarray, n: int, rng: np.random.Generator, margin: int = 2):
-    """
-    Sample center coordinates safely away from image border so blobs fit.
-    """
     H, W = mask.shape
     safe = mask.copy()
     safe[:margin, :] = False
@@ -175,26 +160,15 @@ def sample_centers(mask: np.ndarray, n: int, rng: np.random.Generator, margin: i
 
 
 def inject_shape(img: np.ndarray, y: int, x: int, amp: float, shape: str):
-    """
-    Add a synthetic positive impulse to img in-place.
-    """
     if shape == "pixel":
         img[y, x] += amp
-
-    elif shape == "blob2":
-        img[y:y+2, x:x+2] += amp
-
     elif shape == "blob3":
         img[y-1:y+2, x-1:x+2] += amp
-
     else:
         raise ValueError(f"Unknown shape: {shape}")
 
 
 def support_mask_from_centers(shape_hw: tuple[int, int], centers: list[tuple[int, int]], shape: str) -> np.ndarray:
-    """
-    Build a binary mask of injected support.
-    """
     H, W = shape_hw
     m = np.zeros((H, W), dtype=bool)
 
@@ -202,17 +176,10 @@ def support_mask_from_centers(shape_hw: tuple[int, int], centers: list[tuple[int
         if shape == "pixel":
             if 0 <= y < H and 0 <= x < W:
                 m[y, x] = True
-
-        elif shape == "blob2":
-            y1, y2 = max(0, y), min(H, y+2)
-            x1, x2 = max(0, x), min(W, x+2)
-            m[y1:y2, x1:x2] = True
-
         elif shape == "blob3":
             y1, y2 = max(0, y-1), min(H, y+2)
             x1, x2 = max(0, x-1), min(W, x+2)
             m[y1:y2, x1:x2] = True
-
         else:
             raise ValueError(f"Unknown shape: {shape}")
 
@@ -220,9 +187,6 @@ def support_mask_from_centers(shape_hw: tuple[int, int], centers: list[tuple[int
 
 
 def dilate_binary(mask: np.ndarray, radius: int = 1) -> np.ndarray:
-    """
-    Simple square dilation using NumPy only.
-    """
     if radius <= 0:
         return mask.copy()
 
@@ -241,19 +205,79 @@ def dilate_binary(mask: np.ndarray, radius: int = 1) -> np.ndarray:
 
 
 def support_recall(pred_mask: np.ndarray, inj_support: np.ndarray, dilate_radius: int = 1) -> float:
-    """
-    Event-level recall:
-    count an injected event as recovered if prediction overlaps a dilated support.
-    For simplicity with many injections, this computes support overlap fraction.
-    """
-    supp = dilate_binary(inj_support, radius=dilate_radius)
     n = int(inj_support.sum())
     if n == 0:
         return 0.0
 
-    # fraction of injected support pixels "covered" by prediction in a tolerant way
-    covered = np.sum(inj_support & supp & dilate_binary(pred_mask, radius=dilate_radius))
+    pred_d = dilate_binary(pred_mask, radius=dilate_radius)
+    covered = np.sum(inj_support & pred_d)
     return float(covered) / float(n)
+
+
+def support_slices_from_centers(centers: list[tuple[int, int]], shape: str, H: int, W: int):
+    out = []
+
+    for y, x in centers:
+        if shape == "pixel":
+            y1, y2 = max(0, y), min(H, y + 1)
+            x1, x2 = max(0, x), min(W, x + 1)
+        elif shape == "blob3":
+            y1, y2 = max(0, y - 1), min(H, y + 2)
+            x1, x2 = max(0, x - 1), min(W, x + 2)
+        else:
+            raise ValueError(f"Unknown shape: {shape}")
+
+        out.append((slice(y1, y2), slice(x1, x2)))
+
+    return out
+
+
+def temporal_z_map_for_target(Tstack: np.ndarray, target_pos: int, k: int, s_floor_t: float) -> np.ndarray:
+    N, H, W = Tstack.shape
+    win = 2 * k + 1
+
+    idxs = [(target_pos + j) % N for j in range(-k, k + 1)]
+    Wv = Tstack[idxs, :, :]  # (win, H, W)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+
+        med_t = np.nanmedian(Wv, axis=0)
+
+        left = Wv[:k, :, :]
+        right = Wv[k+1:, :, :]
+
+        med_L = np.nanmedian(left, axis=0)
+        med_R = np.nanmedian(right, axis=0)
+        slope = (med_R - med_L) / max(2 * k, 1)
+
+        j = (np.arange(win, dtype=np.float32) - k)[:, None, None]
+        Wv_detr = Wv - (med_t[None, :, :] + slope[None, :, :] * j)
+
+        med_d = np.nanmedian(Wv_detr, axis=0)
+        mad_d = np.nanmedian(np.abs(Wv_detr - med_d[None, :, :]), axis=0)
+
+    s_t = 1.4826 * mad_d + s_floor_t
+    z_t = (Tstack[target_pos] - med_t) / s_t
+    return z_t.astype(np.float32)
+
+
+def event_max_zscores(z_map: np.ndarray, support_slices: list[tuple[slice, slice]]) -> np.ndarray:
+    vals = []
+    for ys, xs in support_slices:
+        patch = z_map[ys, xs]
+        if np.all(~np.isfinite(patch)):
+            vals.append(np.nan)
+        else:
+            vals.append(float(np.nanmax(patch)))
+    return np.asarray(vals, dtype=np.float32)
+
+
+def summarize_z(zvals: np.ndarray):
+    zf = zvals[np.isfinite(zvals)]
+    if zf.size == 0:
+        return np.nan, np.nan, np.nan
+    return float(np.nanmedian(zf)), float(np.nanquantile(zf, 0.90)), float(np.nanmax(zf))
 
 
 # ============================================================
@@ -270,7 +294,6 @@ def build_stack():
     if len(ob_files) == 0 or len(dc_files) == 0:
         raise ValueError("Need OB and DC files.")
 
-    # same subset strategy as current pipeline
     Nsub = 40
     idxs = np.linspace(0, len(raw_files) - 1, Nsub, dtype=int)
     raw_files = [raw_files[i] for i in idxs]
@@ -321,9 +344,6 @@ if __name__ == "__main__":
     border_ok = make_border_mask(Tref.shape, BORDER_EXCLUDE)
     usable = finite & border_ok & good_mask
 
-    # --------------------------------------------------------
-    # Base segmentation: sample / background / edge
-    # --------------------------------------------------------
     edge = make_edge_band(Tref, q=EDGE_Q) & usable
     grad = gradient_magnitude(Tref)
     _, local_mad = nan_local_median_mad_2d(Tref, size=LOCAL_SIZE, eps=1e-6)
@@ -337,9 +357,6 @@ if __name__ == "__main__":
     nonedge_bg = background & (~edge)
     nonedge_bulk = sample & (~edge)
 
-    # --------------------------------------------------------
-    # Refined benchmark regions
-    # --------------------------------------------------------
     bg_grad_thr = qthr(grad[nonedge_bg], BG_GRAD_Q)
     bg_mad_thr  = qthr(local_mad[nonedge_bg], BG_MAD_Q)
 
@@ -364,85 +381,93 @@ if __name__ == "__main__":
         "edge_sample": edge_sample,
     }
 
-    print("=== Stack Injection Benchmark Setup ===")
+    print("=== Reduced Tau Benchmark Setup ===")
     print("Target file:", target_name)
     print("Target stack position:", target_pos)
     print("ROI:", ROI)
     print(f"Otsu threshold: {otsu_thr:.6f}")
     print("")
-    print(f"Usable pixels        : {int(usable.sum()):,}")
-    print(f"Background pixels    : {int(background.sum()):,}")
-    print(f"Sample pixels        : {int(sample.sum()):,}")
-    print(f"Non-edge background  : {int(nonedge_bg.sum()):,}")
-    print(f"Non-edge bulk        : {int(nonedge_bulk.sum()):,}")
-    print(f"Edge-sample pixels   : {int(edge_sample.sum()):,}")
-    print("")
-    print("Refined benchmark regions:")
     print(f"flat_background px   : {int(flat_background.sum()):,}")
     print(f"smooth_bulk px       : {int(smooth_bulk.sum()):,}")
     print(f"edge_sample px       : {int(edge_sample.sum()):,}")
     print("")
-    print("Region thresholds:")
-    print(f"BG grad thr          : {bg_grad_thr:.6g}")
-    print(f"BG local MAD thr     : {bg_mad_thr:.6g}")
-    print(f"Bulk grad thr        : {bulk_grad_thr:.6g}")
-    print(f"Bulk local MAD thr   : {bulk_mad_thr:.6g}")
+    print("Testing tau_t list:", TAU_T_LIST)
+    print("Shapes:", SHAPES)
+    print("Amplitudes:", AMPLITUDES)
     print("")
 
-    # --------------------------------------------------------
-    # Benchmark loop
-    # --------------------------------------------------------
-    for shape_name in SHAPES:
-        print(f"================ SHAPE = {shape_name} ================")
+    for tau_t in TAU_T_LIST:
+        print(f"================ tau_t = {tau_t:.1f} ================")
 
-        for amp in AMPLITUDES:
-            print(f"--- Amplitude = {amp:.4f} ---")
+        for shape_name in SHAPES:
+            print(f"------ shape = {shape_name} ------")
 
-            for region_name, region_mask in region_masks.items():
-                centers = sample_centers(region_mask, N_INJECT, rng, margin=2)
+            for amp in AMPLITUDES:
+                print(f"--- amplitude = {amp:.4f} ---")
 
-                Tinj = Tstack.copy()
+                for region_name, region_mask in region_masks.items():
+                    centers = sample_centers(region_mask, N_INJECT, rng, margin=2)
 
-                # inject only into target projection
-                for y, x in centers:
-                    if np.isfinite(Tinj[target_pos, y, x]):
-                        inject_shape(Tinj[target_pos], y, x, amp, shape_name)
+                    Tinj = Tstack.copy()
 
-                inj_support = support_mask_from_centers(
-                    Tinj[target_pos].shape,
-                    centers,
-                    shape_name,
-                )
+                    for y, x in centers:
+                        if np.isfinite(Tinj[target_pos, y, x]):
+                            inject_shape(Tinj[target_pos], y, x, amp, shape_name)
 
-                _, gmask, debug = gamma_remove_trend_tiled(
-                    Tinj,
-                    k=DET_K,
-                    tau_t=DET_TAU_T,
-                    s_floor_t=DET_S_FLOOR_T,
-                    tile=DET_TILE,
-                    spatial_size=DET_SPATIAL_SIZE,
-                    tau_s=DET_TAU_S,
-                    s_floor_s=DET_S_FLOOR_S,
-                    edge_q=DET_EDGE_Q,
-                    edge_gate=DET_EDGE_GATE,
-                    edge_dilate=DET_EDGE_DILATE,
-                    edge_tau_boost=DET_EDGE_TAU_BOOST,
-                    return_debug=True,
-                )
+                    inj_support = support_mask_from_centers(
+                        Tinj[target_pos].shape,
+                        centers,
+                        shape_name,
+                    )
 
-                temporal_pred = debug["temporal_mask"][target_pos]
-                spatial_pred  = debug["spatial_mask"][target_pos]
-                final_pred    = debug["final_mask"][target_pos]
+                    support_slices = support_slices_from_centers(
+                        centers,
+                        shape_name,
+                        Tinj[target_pos].shape[0],
+                        Tinj[target_pos].shape[1],
+                    )
 
-                rec_temporal = support_recall(temporal_pred, inj_support, dilate_radius=1)
-                rec_spatial  = support_recall(spatial_pred, inj_support, dilate_radius=1)
-                rec_final    = support_recall(final_pred, inj_support, dilate_radius=1)
+                    z_map = temporal_z_map_for_target(
+                        Tinj,
+                        target_pos=target_pos,
+                        k=DET_K,
+                        s_floor_t=DET_S_FLOOR_T,
+                    )
+                    zvals = event_max_zscores(z_map, support_slices)
+                    z_med, z_p90, z_max = summarize_z(zvals)
 
-                print(
-                    f"{region_name:16s}  "
-                    f"temporal={rec_temporal:.3f}  "
-                    f"spatial={rec_spatial:.3f}  "
-                    f"final={rec_final:.3f}"
-                )
+                    _, gmask, debug = gamma_remove_trend_tiled(
+                        Tinj,
+                        k=DET_K,
+                        tau_t=tau_t,
+                        s_floor_t=DET_S_FLOOR_T,
+                        tile=DET_TILE,
+                        spatial_size=DET_SPATIAL_SIZE,
+                        tau_s=DET_TAU_S,
+                        s_floor_s=DET_S_FLOOR_S,
+                        edge_q=DET_EDGE_Q,
+                        edge_gate=DET_EDGE_GATE,
+                        edge_dilate=DET_EDGE_DILATE,
+                        edge_tau_boost=DET_EDGE_TAU_BOOST,
+                        return_debug=True,
+                    )
 
-            print("")
+                    temporal_pred = debug["temporal_mask"][target_pos]
+                    spatial_pred  = debug["spatial_mask"][target_pos]
+                    final_pred    = debug["final_mask"][target_pos]
+
+                    rec_temporal = support_recall(temporal_pred, inj_support, dilate_radius=1)
+                    rec_spatial  = support_recall(spatial_pred, inj_support, dilate_radius=1)
+                    rec_final    = support_recall(final_pred, inj_support, dilate_radius=1)
+
+                    print(
+                        f"{region_name:16s}  "
+                        f"temporal={rec_temporal:.3f}  "
+                        f"spatial={rec_spatial:.3f}  "
+                        f"final={rec_final:.3f}  "
+                        f"z_med={z_med:.2f}  "
+                        f"z_p90={z_p90:.2f}  "
+                        f"z_max={z_max:.2f}"
+                    )
+
+                print("")
