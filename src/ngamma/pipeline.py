@@ -84,7 +84,7 @@ def process_scan(cfg: ScanConfig):
     Tcorr, gmask = gamma_remove_trend_tiled(
     Tstack,
     k=4,
-    tau_t=6.0,
+    tau_t=4.0,
     s_floor_t=1e-6,
     tile=256,
     spatial_size=9,
@@ -92,7 +92,8 @@ def process_scan(cfg: ScanConfig):
     s_floor_s=1e-6,
     edge_q=0.99,
     edge_gate=True,
-    edge_dilate=3,)
+    edge_dilate=3,
+    edge_tau_boost=4.0,)
 
     flagged = int(np.sum(gmask))
     finite2 = int(np.sum(np.isfinite(Tstack)))
